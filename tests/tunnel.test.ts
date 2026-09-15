@@ -47,6 +47,7 @@ function setupTunnel(fetchImpl: FetchImpl, startTimeoutMs = 1_000) {
   const tunnel = new CloudflaredQuickTunnel(undefined, "cloudflared", {
     spawnImpl,
     fetchImpl,
+    lookupImpl: async () => undefined,
     startTimeoutMs,
   });
   return { child, spawnImpl, tunnel };
@@ -54,6 +55,7 @@ function setupTunnel(fetchImpl: FetchImpl, startTimeoutMs = 1_000) {
 
 function announceUrl(child: FakeCloudflaredProcess): void {
   child.stderr.write(`INF ${QUICK_URL}\n`);
+  child.stderr.write("INF Registered tunnel connection\n");
 }
 
 function healthResponse(): Response {
@@ -99,6 +101,167 @@ describe("parseQuickTunnelUrl", () => {
 });
 
 describe("CloudflaredQuickTunnel", () => {
+  it("reports each readiness stage before the public endpoint becomes ready", async () => {
+    let resolveLookup!: () => void;
+    let resolveFetch!: () => void;
+    let resolveJson!: () => void;
+    const lookupImpl = vi.fn(
+      () => new Promise<void>((resolve) => {
+        resolveLookup = resolve;
+      })
+    );
+    const response = new Response(null, { status: 200 });
+    vi.spyOn(response, "json").mockImplementation(
+      () => new Promise((resolve) => {
+        resolveJson = () => resolve({ service: "c2c-bridge", status: "ok" });
+      })
+    );
+    const child = new FakeCloudflaredProcess();
+    const tunnel = new CloudflaredQuickTunnel(undefined, "cloudflared", {
+      spawnImpl: () => child as unknown as ChildProcess,
+      lookupImpl,
+      fetchImpl: () => new Promise((resolve) => {
+        resolveFetch = () => resolve(response);
+      }),
+      startTimeoutMs: 1_000,
+    });
+
+    const starting = tunnel.start(3333);
+    child.stderr.write(`INF ${QUICK_URL}\n`);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(tunnel.status()).toMatchObject({ running: false, readiness: "SPAWNED" });
+    child.stderr.write("INF Registered tunnel connection\n");
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(tunnel.status()).toMatchObject({ running: false, readiness: "DNS_PENDING" });
+    resolveLookup();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(tunnel.status()).toMatchObject({ running: false, readiness: "CONNECT_PENDING" });
+    resolveFetch();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(tunnel.status()).toMatchObject({ running: false, readiness: "HEALTH_PENDING" });
+    resolveJson();
+    await expect(starting).resolves.toBe(QUICK_URL);
+    expect(tunnel.status()).toMatchObject({ running: true, readiness: "READY" });
+    await tunnel.stop();
+  });
+
+  it("includes the DNS stage and resolver code in the timeout error", async () => {
+    const error = Object.assign(new Error("getaddrinfo ENOTFOUND"), { code: "ENOTFOUND" });
+    const { child, tunnel } = setupTunnel(
+      async () => {
+        throw new TypeError("fetch failed", { cause: error });
+      },
+      50
+    );
+    const starting = tunnel.start(3333);
+    announceUrl(child);
+    await new Promise((resolve) => setImmediate(resolve));
+    child.stderr.write("ERR transient edge connection warning\n");
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(tunnel.status().detail).toBe(
+      "last readiness failure = DNS_PENDING (ENOTFOUND): DNS lookup failed"
+    );
+    await expect(starting).rejects.toThrow(
+      /last readiness failure = DNS_PENDING \(ENOTFOUND\): DNS lookup failed/
+    );
+    expect(tunnel.status()).toMatchObject({ running: false, readiness: "FAILED" });
+  });
+
+  it("keeps an HTTP failure bound to its observed readiness stage", async () => {
+    vi.useFakeTimers();
+    try {
+      const lookupImpl = vi.fn()
+        .mockResolvedValueOnce({ address: "203.0.113.1", family: 4 })
+        .mockImplementation(() => new Promise(() => {}));
+      const child = new FakeCloudflaredProcess();
+      const tunnel = new CloudflaredQuickTunnel(undefined, "cloudflared", {
+        spawnImpl: () => child as unknown as ChildProcess,
+        lookupImpl,
+        fetchImpl: async () => new Response(null, { status: 503 }),
+        startTimeoutMs: 400,
+      });
+
+      const starting = tunnel.start(3333);
+      const settled = starting.catch((error: unknown) => error);
+      announceUrl(child);
+      await vi.advanceTimersByTimeAsync(250);
+
+      expect(tunnel.status()).toMatchObject({
+        readiness: "DNS_PENDING",
+        detail: "last readiness failure = HEALTH_PENDING: Health check returned HTTP 503",
+      });
+      await vi.advanceTimersByTimeAsync(150);
+      expect(await settled).toEqual(
+        expect.objectContaining({
+          message: expect.stringMatching(
+            /last readiness failure = HEALTH_PENDING: Health check returned HTTP 503/
+          ),
+        })
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("classifies non-DNS fetch failures as public connection failures", async () => {
+    const error = Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" });
+    const { child, tunnel } = setupTunnel(
+      async () => {
+        throw new TypeError("fetch failed", { cause: error });
+      },
+      20
+    );
+    const starting = tunnel.start(3333);
+    announceUrl(child);
+
+    await expect(starting).rejects.toThrow(
+      /CONNECT_PENDING \(ECONNREFUSED\): Public request failed/
+    );
+  });
+
+  it("uses bounded backoff while DNS propagation catches up", async () => {
+    vi.useFakeTimers();
+    try {
+      const error = Object.assign(new Error("getaddrinfo ENOTFOUND"), { code: "ENOTFOUND" });
+      const lookupImpl = vi.fn()
+        .mockRejectedValueOnce(error)
+        .mockRejectedValueOnce(error)
+        .mockResolvedValue({ address: "203.0.113.1", family: 4 });
+      const child = new FakeCloudflaredProcess();
+      const tunnel = new CloudflaredQuickTunnel(undefined, "cloudflared", {
+        spawnImpl: () => child as unknown as ChildProcess,
+        lookupImpl,
+        fetchImpl: async () => healthResponse(),
+        startTimeoutMs: 2_000,
+      });
+
+      const starting = tunnel.start(3333);
+      announceUrl(child);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(lookupImpl).toHaveBeenCalledTimes(1);
+      expect(tunnel.status()).toMatchObject({
+        readiness: "DNS_PENDING",
+        detail: "last readiness failure = DNS_PENDING (ENOTFOUND): DNS lookup failed",
+      });
+
+      await vi.advanceTimersByTimeAsync(249);
+      expect(lookupImpl).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(lookupImpl).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(499);
+      expect(lookupImpl).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1);
+
+      await expect(starting).resolves.toBe(QUICK_URL);
+      expect(lookupImpl).toHaveBeenCalledTimes(3);
+      await tunnel.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("resolves only after the public health endpoint identifies the bridge", async () => {
     const fetchImpl = vi.fn(async () => healthResponse());
     const { child, spawnImpl, tunnel } = setupTunnel(fetchImpl);

@@ -4,11 +4,22 @@
  * but ngrok / Tailscale / custom providers can be added without touching
  * the bridge.
  */
+export type TunnelReadinessStage =
+  | "IDLE"
+  | "SPAWNED"
+  | "REGISTERED"
+  | "DNS_PENDING"
+  | "CONNECT_PENDING"
+  | "HEALTH_PENDING"
+  | "READY"
+  | "FAILED";
+
 export interface TunnelStatus {
   running: boolean;
   url: string | null;
   provider: string;
   detail?: string;
+  readiness?: TunnelReadinessStage;
 }
 
 export interface TunnelDoctorReport {
@@ -18,6 +29,7 @@ export interface TunnelDoctorReport {
   running: boolean;
   url: string | null;
   problems: string[];
+  readiness?: TunnelReadinessStage;
 }
 
 export interface TunnelProvider {
