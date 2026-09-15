@@ -54,6 +54,8 @@ Cloudflare account and give the domain. Codex opens a browser for Cloudflare
 login, then keeps `c2c-<project>.your-domain.com`. To stay on the temporary
 address, say you do not have a domain. Switching later: tell Codex you want
 the stable hostname; it runs `c2c tunnel choose --mode named --zone <domain>`.
+Use a dedicated hostname for C2C. C2C replaces an existing DNS record for the
+selected hostname.
 
 ### "配对码无效/过期"
 Pairing codes are one-time and expire after ~5 minutes. Generate one only

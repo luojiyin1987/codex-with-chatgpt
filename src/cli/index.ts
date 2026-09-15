@@ -1148,7 +1148,7 @@ tunnelCmd
   .requiredOption("--mode <mode>", "quick or named")
   .option("-w, --workspace <path>")
   .option("--zone <domain>", "Cloudflare domain for a named hostname")
-  .option("--hostname <hostname>", "override the default c2c-<project>.<zone>")
+  .option("--hostname <hostname>", "assign this hostname to C2C and replace its existing DNS record")
   .option("--json", "machine-readable output", false)
   .action(async (opts: { mode: string; workspace?: string; zone?: string; hostname?: string; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);

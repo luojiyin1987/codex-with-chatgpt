@@ -25,8 +25,16 @@ export interface CloudflaredAccount {
   login(): Promise<void>;
   listTunnels(): Promise<ListedTunnel[]>;
   createTunnel(name: string): Promise<ListedTunnel>;
-  routeDns(tunnelName: string, hostname: string): Promise<void>;
+  routeDns(tunnelId: string, hostname: string): Promise<void>;
 }
+
+interface CloudflaredCommandResult {
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+}
+
+type RunCloudflared = (args: string[]) => CloudflaredCommandResult;
 
 export function cloudflaredCertPath(): string {
   const override = process.env.TUNNEL_ORIGIN_CERT?.trim();
@@ -75,12 +83,11 @@ export function parseCreatedTunnel(output: string, name: string): ListedTunnel |
   return id ? { id, name } : null;
 }
 
-export function isBenignRouteError(message: string): boolean {
-  return /already exists|duplicate|exists as a cname/i.test(message);
-}
-
 export class ProcessCloudflaredAccount implements CloudflaredAccount {
-  constructor(private readonly binaryOverride?: string) {}
+  constructor(
+    private readonly binaryOverride?: string,
+    private readonly runOverride?: RunCloudflared
+  ) {}
 
   private binary(): string {
     const bin = this.binaryOverride ?? findBinary("cloudflared");
@@ -156,13 +163,14 @@ export class ProcessCloudflaredAccount implements CloudflaredAccount {
     throw new Error(result.stderr || result.stdout || `Unable to create tunnel ${name}`);
   }
 
-  async routeDns(tunnelName: string, hostname: string): Promise<void> {
-    const result = this.run(["tunnel", "route", "dns", tunnelName, hostname]);
-    if (result.ok || isBenignRouteError(`${result.stdout}\n${result.stderr}`)) return;
+  async routeDns(tunnelId: string, hostname: string): Promise<void> {
+    const result = this.run(["tunnel", "route", "dns", "--overwrite-dns", tunnelId, hostname]);
+    if (result.ok) return;
     throw new Error(result.stderr || result.stdout || `Unable to route ${hostname}`);
   }
 
-  private run(args: string[]): { ok: boolean; stdout: string; stderr: string } {
+  private run(args: string[]): CloudflaredCommandResult {
+    if (this.runOverride) return this.runOverride(args);
     const result = spawnSync(this.binary(), args, {
       encoding: "utf8",
       timeout: COMMAND_TIMEOUT_MS,
@@ -205,7 +213,7 @@ export async function provisionNamedTunnel(opts: {
   try {
     if (!account.hasCert()) await account.login();
     const tunnel = await account.createTunnel(tunnelName);
-    await account.routeDns(tunnel.name, hostname);
+    await account.routeDns(tunnel.id, hostname);
     const state = writeTunnelState({
       workspaceId: opts.workspaceId,
       preference: "named",

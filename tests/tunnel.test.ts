@@ -13,9 +13,9 @@ import { normalizeNamedTunnelHostname } from "../src/tunnel/cloudflared-named.js
 import { hostnameSlug, parseZoneInput, suggestedNamedHostname } from "../src/tunnel/hostname.js";
 import {
   chooseQuickTunnel,
-  isBenignRouteError,
   parseCreatedTunnel,
   parseTunnelList,
+  ProcessCloudflaredAccount,
   provisionNamedTunnel,
   type CloudflaredAccount,
 } from "../src/tunnel/named-provision.js";
@@ -286,8 +286,33 @@ ID                                   NAME          CREATED
     ).toEqual({ id: "22222222-2222-2222-2222-222222222222", name: "c2c-abc" });
   });
 
-  it("treats an existing DNS route as success", () => {
-    expect(isBenignRouteError("Failed to add route: record already exists")).toBe(true);
+  it("routes DNS to the selected tunnel ID and replaces a stale record", async () => {
+    const run = vi.fn(() => ({ ok: true, stdout: "", stderr: "" }));
+    const account = new ProcessCloudflaredAccount("cloudflared", run);
+
+    await account.routeDns("33333333-3333-3333-3333-333333333333", "c2c-demo.example.com");
+
+    expect(run).toHaveBeenCalledWith([
+      "tunnel",
+      "route",
+      "dns",
+      "--overwrite-dns",
+      "33333333-3333-3333-3333-333333333333",
+      "c2c-demo.example.com",
+    ]);
+  });
+
+  it("fails when cloudflared cannot replace an existing DNS route", async () => {
+    const run = vi.fn(() => ({
+      ok: false,
+      stdout: "",
+      stderr: "Failed to add route: record already exists",
+    }));
+    const account = new ProcessCloudflaredAccount("cloudflared", run);
+
+    await expect(
+      account.routeDns("33333333-3333-3333-3333-333333333333", "c2c-demo.example.com")
+    ).rejects.toThrow("record already exists");
   });
 });
 
@@ -309,7 +334,9 @@ describe("tunnel preference state", () => {
       login: async () => undefined,
       listTunnels: async () => [],
       createTunnel: async (name) => ({ id: "33333333-3333-3333-3333-333333333333", name }),
-      routeDns: async () => undefined,
+      routeDns: async (tunnelId) => {
+        expect(tunnelId).toBe("33333333-3333-3333-3333-333333333333");
+      },
     };
     return provisionNamedTunnel({
       workspaceId: "abcdef123456",
@@ -346,5 +373,30 @@ describe("tunnel preference state", () => {
       expect(result.state.preference).toBe("quick");
       expect(result.userMessage).toMatch(/临时地址/);
     });
+  });
+
+  it("falls back without saving named state when DNS routing fails", async () => {
+    stateDirs.push(isolateStateDir());
+    const account: CloudflaredAccount = {
+      hasCert: () => true,
+      login: async () => undefined,
+      listTunnels: async () => [],
+      createTunnel: async (name) => ({ id: "44444444-4444-4444-4444-444444444444", name }),
+      routeDns: async () => {
+        throw new Error("DNS record belongs to another tunnel");
+      },
+    };
+
+    const result = await provisionNamedTunnel({
+      workspaceId: "ws3",
+      workspaceName: "Demo",
+      zone: "example.com",
+      account,
+    });
+
+    expect(result.fallback).toBe(true);
+    expect(result.state.preference).toBe("quick");
+    expect(result.error).toMatch(/belongs to another tunnel/);
+    expect(isNamedTunnelReady(readTunnelState("ws3"))).toBe(false);
   });
 });
